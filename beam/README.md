@@ -76,6 +76,131 @@ payloads change batch idempotency keys and require fresh projects. If replaying 
 an idempotency conflict, the compatibility fallback assumes the project has finished processing;
 it cannot verify the original push's status.
 
+## Running against Fibonna
+
+`run_fibonna.py` runs the same benchmark against a Fibonna stack. The dataset, ExaBase's prompts,
+the scoring (`scoring.py`) and `verify.py` are the ones above, unchanged; only where the memory
+lives differs. `fibonna_api.py` is the adapter, in the shape of `past_api.py`: it ingests a turn,
+polls until compile has finished, and recalls through search, returning the evidence text.
+
+**Run it only on a throwaway stack.** Never on the live stack or on a pilot's stack. The run writes
+thousands of memories and cannot take them back, so give it projects made for it, and delete the
+stack when you are done.
+
+### Environment
+
+| Variable | What it is |
+|---|---|
+| `FIBONNA_API_URL` | the stack's API, e.g. `https://api.example.test` |
+| `FIBONNA_API_TOKEN` | a token that can read and write the benchmark projects |
+| `FIBONNA_BEAM_PROJECT` | the benchmark project's slug; with `{conversation}` in it, one project per conversation (below) |
+| `OPENROUTER_API_KEY` | the answer and judge model, as above |
+| `BEAM_JUDGE_MODEL` | optional: an OpenRouter model id for the judge only (see "A second judge") |
+
+Nothing is built in: no URL, token or project name is in the code. The projects must exist
+already; the harness never creates one.
+
+**One project per conversation.** past.dev's run gives each conversation its own project, so a
+recall finds only that conversation's turns. Do the same: create one project per conversation,
+named by the conversation's id (`beam-100k-1` to `beam-100k-20`), and set
+`FIBONNA_BEAM_PROJECT='beam-100k-{conversation}'`. With a slug that has no `{conversation}`, the
+harness refuses to run more than one conversation, because they would share one memory and each
+question would be answered from the others' turns too.
+
+The stack needs: the compile drain running (the gateway's schedule), and search accepting up to
+100 results and an 8,000-token evidence budget, which is past.dev's recall budget (the setting
+behind `search_evidence_budget_enabled`). It uses these product routes, and no others:
+`GET /api/v1/projects/resolve`, `POST /api/v1/ingest/text`, `GET /api/v1/knowledge/documents/{id}`,
+`GET /api/v1/brain/compile/jobs`, `GET /api/v1/brain/index` and
+`GET /api/v1/knowledge/projects/{id}/search`.
+
+### How a conversation is sent and asked
+
+- **Turns.** Each turn is one project memory, in order, with BEAM's date for it as its event time
+  (`occurred_at`, to the microsecond, as in the Past run). Its title is the author and the turn's
+  id, which keeps two turns with the same words as two memories. Sending a turn again finds the
+  memory already stored, so a run that stopped can be started again without storing anything twice.
+- **Waiting.** The harness polls until every turn has been chunked, then until the project's
+  compile queue has had no pending or running job for two polls in a row, and logs the number of
+  wiki pages the compile produced. A compile job that failed stops the run.
+- **Asking.** Search runs as of the moment the question is asked, the end of the conversation or
+  for knowledge-update questions the update the dataset cites, and the turn at that moment is
+  included. The answer model reads the evidence search returns, in ExaBase's answer prompt; the
+  answer Fibonna's own search can write is not asked for.
+
+### Dry run: one conversation
+
+Conversation 1 is the smallest: 188 turns (about 131,000 tokens) and 20 questions.
+
+```bash
+pip install -r requirements.txt
+export FIBONNA_API_URL=...             # the throwaway stack
+export FIBONNA_API_TOKEN=...
+export FIBONNA_BEAM_PROJECT=beam-dry   # a project you created for this
+export OPENROUTER_API_KEY=...
+python run_fibonna.py --split 100k --conversations 1 --output results/fibonna-dry
+python verify.py results/fibonna-dry
+```
+
+Before the full run, check in the output that `failedQuestions` and `failedVerdicts` in
+`summary.json` are 0, that `compiledPages` is not 0, and that the evidence in a few `recall`
+records is from that conversation. Then read the compile cost per turn the stack reports and
+replace the estimate below with it.
+
+### The 100K run
+
+20 conversations, 400 questions (40 in each of the ten categories), 5,732 turns and about
+3.06 million tokens. Create the 20 projects, then:
+
+```bash
+export FIBONNA_BEAM_PROJECT='beam-100k-{conversation}'
+python run_fibonna.py --split 100k
+python verify.py results/fibonna-100k
+```
+
+Results go to `results/fibonna-100k/`, which git ignores. Run the command again to resume: scored
+conversations are skipped. Run it with another `--output` to ask every question again, for example
+with another judge; the turns are found in their projects, not stored again, so nothing compiles a
+second time.
+
+### Compile cost estimate
+
+Every turn is a memory and each memory is compiled once. The compile makes up to seven model calls
+and costs $0.14 to $0.16 on Sonnet 5, the internal design estimate (not measured).
+
+| Run | Turns | Compiles at $0.14 to $0.16 |
+|---|---:|---:|
+| Dry run, conversation 1 | 188 | $26 to $30 |
+| 100K split, 20 conversations | 5,732 | $800 to $920 |
+
+This is the compile alone. The answers and the judge go through OpenRouter and are charged
+separately: one answer per question and one judge call per rubric item. One turn, in conversation
+4, is 348,469 characters (about 87,000 tokens), far larger than the rest (the next is 53,107); it
+may compile for more than the average, and a stack with a request size limit may refuse it.
+
+### A second judge
+
+past.dev's run has one model answer and judge. To also report a judge from another family, set
+`BEAM_JUDGE_MODEL` to the OpenRouter id of a model that is not OpenAI's. Only the judge's calls use
+it: the answers still come from `openai/gpt-5.6-luna`, and `summary.json` records both models.
+Report the two runs side by side, with the model ids. Try it in the dry run first: the judge is
+asked for strict JSON, which not every provider enforces.
+
+### Licences
+
+A Fibonna run's results hold dataset questions, reference answers and recalled excerpts, so they
+keep the dataset's CC BY-SA 4.0 terms, and ExaBase's prompts stay unchanged and credited; see
+[NOTICE.md](NOTICE.md) before publishing any of it.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+They run the adapter and the runner against a stand-in for the Fibonna API on a local port, and a
+stand-in for the model. Nothing reaches the network.
+
 ## Check a run
 
 ```bash
@@ -128,6 +253,9 @@ downloads ExaBase's adapter, checks its SHA-256 (`584b672d…fc43`) and confirms
 | `run.py` | the whole run, one function per step |
 | `dataset.py` | loads BEAM and turns each conversation into messages and questions |
 | `past_api.py` | the past.dev API calls |
+| `run_fibonna.py` | the same run against Fibonna ([how](#running-against-fibonna)) |
+| `fibonna_api.py` | the Fibonna API calls |
+| `tests/` | offline tests of the Fibonna adapter and runner |
 | `exabase_prompts.py` | ExaBase's answer and judge prompts |
 | `llm.py` | the answer and judge model |
 | `scoring.py` | scoring and the summary |

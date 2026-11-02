@@ -1,6 +1,8 @@
 """The answer and judge model, called through OpenRouter.
 
-One model answers and judges: openai/gpt-5.6-luna, with reasoning off.
+One model answers and judges: openai/gpt-5.6-luna, with reasoning off. To judge with another model,
+of a different family, set BEAM_JUDGE_MODEL to its OpenRouter id: the answers are still written by
+the first one, and only the judge's calls change.
 
 A request is retried on a rate limit, a server error, a dropped connection or an unreadable HTTP
 response: four attempts in all. A request that still fails, an empty reply, or a judge reply that is
@@ -18,6 +20,7 @@ import httpx
 from log import log
 
 MODEL = "openai/gpt-5.6-luna"
+JUDGE_MODEL = os.environ.get("BEAM_JUDGE_MODEL", "").strip() or MODEL
 REASONING_EFFORT = "none"
 BASE_URL = "https://openrouter.ai/api/v1"
 TIMEOUT_SECONDS = 90
@@ -55,7 +58,7 @@ async def complete_text(prompt: str) -> str:
 async def complete_json(prompt: str, schema: dict) -> dict:
     """A reply held to a strict JSON schema, from a provider that enforces it."""
     response = await _post({
-        "model": MODEL,
+        "model": JUDGE_MODEL,
         "reasoning": {"effort": REASONING_EFFORT},
         "usage": {"include": True},
         "messages": [{"role": "user", "content": prompt}],
