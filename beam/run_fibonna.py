@@ -47,6 +47,7 @@ from fibonna_api import (
     FibonnaApi,
     ProjectMissing,
     Settings,
+    StallClock,
 )
 from log import duration, log
 from run import (
@@ -108,6 +109,9 @@ class Run:
         self.recall_slots = asyncio.Semaphore(RECALLS_AT_ONCE)
         self.write_lock = asyncio.Lock()
         self.apis: list[FibonnaApi] = []  # closed when the run ends, however it ends
+        # Every conversation's wait moves it, so that one whose jobs the queue reaches last is not
+        # stopped while the others compile.
+        self.stall_clock = StallClock()
         self.compiled_pages: dict[str, int] = {}
         self.turns_sent = 0
         self.processed = 0
@@ -138,7 +142,10 @@ class Run:
             pages = await sent.api.pages_of_a_compiled_project()
         else:
             pages = await sent.api.wait_until_compiled(
-                sent.document_ids, sent.conversation.id, self.stall_timeout
+                sent.document_ids,
+                sent.conversation.id,
+                self.stall_timeout,
+                self.stall_clock,
             )
         self.compiled_pages[sent.conversation.id] = pages
         self.processed += 1

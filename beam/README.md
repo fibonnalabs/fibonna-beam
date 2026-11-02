@@ -107,9 +107,12 @@ named by the conversation's id (`beam-100k-1` to `beam-100k-20`), and set
 harness refuses to run more than one conversation, because they would share one memory and each
 question would be answered from the others' turns too.
 
-The stack needs: the compile drain running (the gateway's schedule), and search accepting up to
-100 results and an 8,000-token evidence budget, which is past.dev's recall budget (the setting
-behind `search_evidence_budget_enabled`). It uses these product routes, and no others:
+The stack needs: the compile drain running (the gateway's schedule), compile on
+(`FIBONNA_BRAIN_COMPILE_ENABLED`), the monthly model spend cap raised above the run's compile cost
+or turned off with 0 (`FIBONNA_MODEL_SPEND_MONTHLY_CAP_USD`; at its default of $10 the stack stops
+compiling for the owner and every job stays pending), and search accepting up to 100 results and an
+8,000-token evidence budget, which is past.dev's recall budget (the setting behind
+`search_evidence_budget_enabled`). It uses these product routes, and no others:
 `GET /api/v1/projects/resolve`, `POST /api/v1/ingest/text`, `GET /api/v1/brain/compile/jobs`,
 `GET /api/v1/brain/index` and `GET /api/v1/knowledge/projects/{id}/search`.
 
@@ -123,18 +126,24 @@ behind `search_evidence_budget_enabled`). It uses these product routes, and no o
   waits for each turn separately. A turn is chunked first and its compile job is queued a while
   after that, so a turn with no job yet is not compiled: the harness keeps waiting for the job to
   exist, then for it to finish. It logs the number of wiki pages the compile produced. A job that
-  failed or was skipped stops the run, naming the turn. So does a wait in which nothing moves for 30
-  minutes, either because a turn never got a job (compile is off in the stack, or its chunking
-  failed) or because a job stays pending or running (the compile drain is not running);
-  `--compile-stall-minutes N` changes the 30. The time counts only while nothing moves, so a
-  conversation that takes hours to compile is not stopped.
-- **Seeing the jobs.** `GET /api/v1/brain/compile/jobs` lists a project's newest jobs of one status,
-  100 at most, with no way to page on. The harness asks for each status in turn, every few
-  seconds and every 25 turns while sending, and keeps what it has seen. A job that completed and
-  then fell out of the newest 100 before the harness ever listed it cannot be seen again: that
-  happens when the turns of a conversation are sent again into a project that already compiled
-  them. The wait then stops with the stall message above, naming the documents it could not see a
-  job for. To ask again about a project that is already compiled, use `--reuse` (below).
+  failed or was skipped stops the run, naming the turn. So does a wait in which nothing moves for
+  60 minutes, either because a turn never got a job (compile is off in the stack, or its chunking
+  failed) or because a job stays pending or running (the compile drain is not running, or the
+  stack's spend cap is reached); `--compile-stall-minutes N` changes the 60. The time counts only
+  while nothing moves, in any conversation: the stack's queue takes the newest jobs first, so the
+  conversation sent first can stand still for hours while the later ones compile.
+- **Seeing the jobs.** `GET /api/v1/brain/compile/jobs` lists a project's newest jobs of one status
+  by when they were created, 100 at most, with no way to page on. The harness asks for each status
+  in turn, every few seconds and every 25 turns while sending, and keeps what it has seen. A job
+  the queue takes last, such as the first turn's, finishes after more than 100 newer jobs have, and
+  then no listing shows it. Two things settle it. A job last seen queued that the pending, running,
+  failed and skipped listings no longer show, in two rounds in a row, has completed; this holds
+  only while those listings are not themselves at 100, so a job a full listing may hide stays
+  waited for. And a turn whose job was never seen, such as one sent again into a project that is
+  already compiled, counts as compiled when the project's wiki holds its source page,
+  `src-document-<id>-<title>`, which a finished compile writes for each document. If neither
+  shows it, the wait stops with the stall message above, naming the documents it could not see a
+  job for.
 - **Asking.** Search runs as of the moment the question is asked, the end of the conversation or
   for knowledge-update questions the update the dataset cites, and the turn at that moment is
   included. The answer model reads the evidence search returns, in ExaBase's answer prompt; the
@@ -172,9 +181,8 @@ python verify.py results/fibonna-100k
 
 Results go to `results/fibonna-100k/`, which git ignores. If the run stops, run the command again:
 scored conversations are skipped, and a conversation that was not finished is sent again (turns
-already stored are found, not stored twice) and waited for again. That second wait can hit the limit
-described under "Seeing the jobs" if the conversation had been compiled in full; start it in a
-fresh project, or use `--reuse` if its first run did finish waiting.
+already stored are found, not stored twice) and waited for again. A conversation that had been
+compiled in full is waited for through the source pages described under "Seeing the jobs".
 
 To ask every question again, for example with another judge, run it with `--reuse` and another
 `--output`:

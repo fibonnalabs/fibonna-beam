@@ -7,7 +7,8 @@ happened before a moment (that moment excluded) and echoes the window it applied
 The compile queue works as the real one does. A turn's job is queued some time after the turn is
 stored (`hold_compile_enqueue` holds that moment back until `release_compile_enqueue`). The jobs
 route lists a project's newest jobs of one status, `limit` at most. A job moves on each time it is
-listed: pending, running, then `final_status`.
+listed: pending, running, then `final_status`. A job that completes leaves a source page for its
+turn in the wiki index, as a compile does (`source_pages` False: it leaves none).
 """
 
 import json
@@ -49,6 +50,12 @@ class FakeFibonna:
             "completed"  # or "failed" or "skipped": how a job that runs ends
         )
         self.compiled_at_first_search: int | None = None
+        # False: a completed compile leaves no page for its turn.
+        self.source_pages = True
+        # Other pages the wiki holds, by slug.
+        self.extra_slugs: list[str] = []
+        # Job id -> how many of the next listings, of any status, leave it out.
+        self.hidden: dict[int, int] = {}
         self._held: list[int] = []
         self.echo_window = True
         self.keep_event_time = True  # False: dates a turn by when it arrived
@@ -97,15 +104,7 @@ class FakeFibonna:
         if method == "GET" and path == "/api/v1/brain/compile/jobs":
             return self.list_compile_jobs(query)
         if method == "GET" and path == "/api/v1/brain/index":
-            return 200, [
-                {
-                    "slug": f"page-{i}",
-                    "title": f"Page {i}",
-                    "page_type": "concept",
-                    "one_liner": "x",
-                }
-                for i in range(self.pages)
-            ]
+            return 200, self.wiki_pages(int(query["project_id"]))
         if method == "GET" and (
             m := re.fullmatch(r"/api/v1/knowledge/projects/(\d+)/search", path)
         ):
@@ -171,6 +170,39 @@ class FakeFibonna:
                 self.enqueue_compile(document_id)
             self._held.clear()
 
+    def wiki_pages(self, project_id: int) -> list[dict]:
+        """The project's pages: `pages` of other kinds, and a source page per turn compiled."""
+        pages = [
+            {
+                "slug": f"page-{i}",
+                "title": f"Page {i}",
+                "page_type": "concept",
+                "one_liner": "x",
+            }
+            for i in range(self.pages)
+        ]
+        pages += [
+            {"slug": slug, "title": slug, "page_type": "concept", "one_liner": "x"}
+            for slug in self.extra_slugs
+        ]
+        if self.source_pages:
+            for job in self.jobs.values():
+                if (
+                    job["project_id"] == project_id
+                    and job["source_type"] == "document"
+                    and job["status"] == "completed"
+                ):
+                    slug = f"src-document-{job['source_id']}-quick-note-turn-md"
+                    pages.append(
+                        {
+                            "slug": slug,
+                            "title": "Turn",
+                            "page_type": "source_summary",
+                            "one_liner": "x",
+                        }
+                    )
+        return pages
+
     def list_compile_jobs(self, query: dict) -> tuple[int, object]:
         limit = int(query.get("limit", 20))
         if not 1 <= limit <= 100:
@@ -178,10 +210,13 @@ class FakeFibonna:
         project_id = int(query["project_id"])
         status = query.get("status")
         newest_first = sorted(self.jobs.values(), key=lambda job: -job["id"])
+        omitted = {job_id for job_id, asks in self.hidden.items() if asks > 0}
+        self.hidden = {job_id: max(asks - 1, 0) for job_id, asks in self.hidden.items()}
         listed = [
             job
             for job in newest_first
             if job["project_id"] == project_id
+            and job["id"] not in omitted
             and (status is None or job["status"] == status)
         ][:limit]
         views = [dict(job) for job in listed]
