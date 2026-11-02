@@ -404,7 +404,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "conversations": len(selected),
         **scoring.summarize(scored),
         "answerModel": llm.MODEL,
-        "judgeModel": llm.MODEL,
+        "judgeModel": llm.JUDGE_MODEL,
         "reasoningEffort": llm.REASONING_EFFORT,
         "recall": {"limit": RECALL_LIMIT, "maxTokens": RECALL_MAX_TOKENS},
         "prompts": {"source": exabase_prompts.SOURCE_URL, "sha256": exabase_prompts.SOURCE_SHA256},
