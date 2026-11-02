@@ -5,11 +5,15 @@
 The run has the same three phases as run.py, each over every conversation:
 
     1. send: ingest every turn into the conversation's project, with its own time as its event time
-    2. wait until Fibonna has chunked every turn and its compile queue has drained
+    2. wait until every turn's compile job has completed
     3. score: ask each question, answer it from what Fibonna recalls, and score the answer
 
 The dataset, ExaBase's prompts and the scoring are those of run.py; so are the answer step and the
 summary's layout. Only where the memory lives differs, and `fibonna_api.py` is all of that.
+
+With --reuse, a run asks again about conversations an earlier run sent and waited for: it sends
+nothing and waits for nothing, and stops if a project is still compiling or has no wiki pages.
+That is how to score the same memory with another judge.
 
 Environment: FIBONNA_API_URL, FIBONNA_API_TOKEN, FIBONNA_BEAM_PROJECT, OPENROUTER_API_KEY. To judge
 with a second model, of another family, BEAM_JUDGE_MODEL.
@@ -38,6 +42,7 @@ from dataset import (
 from fibonna_api import (
     RECALL_LIMIT,
     RECALL_MAX_TOKENS,
+    STALL_TIMEOUT_SECONDS,
     CompileFailed,
     FibonnaApi,
     ProjectMissing,
@@ -95,6 +100,8 @@ class Run:
         self.split = args.split
         self.settings = settings
         self.output = Path(args.output or f"results/fibonna-{args.split}")
+        self.stall_timeout = args.compile_stall_minutes * 60
+        self.reusing = args.reuse
         self.results = self.output / "results.jsonl"
         self.sending_slots = asyncio.Semaphore(CONVERSATIONS_SENT_AT_ONCE)
         self.scoring_slots = asyncio.Semaphore(CONVERSATIONS_SCORED_AT_ONCE)
@@ -110,7 +117,8 @@ class Run:
         async with self.sending_slots:
             conversation = build_conversation(row)
             log(
-                f"sending: {len(conversation.messages)} turns, {len(conversation.questions)} questions",
+                f"{'reusing' if self.reusing else 'sending'}: {len(conversation.messages)} turns, "
+                f"{len(conversation.questions)} questions",
                 conversation.id,
             )
             api = FibonnaApi(
@@ -121,14 +129,17 @@ class Run:
             self.apis.append(api)
             project_id = await api.open_project()
             log(f"project {api.project} is {project_id}", conversation.id)
-            document_ids = await ingest(api, conversation)
+            document_ids = [] if self.reusing else await ingest(api, conversation)
             self.turns_sent += len(document_ids)
             return Sent(conversation, api, document_ids)
 
     async def wait(self, sent: Sent, started: float) -> None:
-        pages = await sent.api.wait_until_compiled(
-            sent.document_ids, sent.conversation.id
-        )
+        if self.reusing:
+            pages = await sent.api.pages_of_a_compiled_project()
+        else:
+            pages = await sent.api.wait_until_compiled(
+                sent.document_ids, sent.conversation.id, self.stall_timeout
+            )
         self.compiled_pages[sent.conversation.id] = pages
         self.processed += 1
         log(
@@ -192,7 +203,8 @@ async def run_phases(run: Run, to_run: list[dict]) -> None:
         sending = [group.create_task(run.send(row)) for row in to_run]
     sent = [task.result() for task in sending]
 
-    # No time limit: a large split takes hours, and a turn Fibonna cannot compile stops the run.
+    # No time limit on the whole wait: a large split takes hours. A turn Fibonna cannot compile, or
+    # a compile queue that stops moving, stops the run.
     log(f"phase 2/3: waiting until Fibonna has compiled {len(sent)} conversation(s)")
     started = time.monotonic()
     progress = asyncio.create_task(run.log_processing_progress(len(sent), started))
@@ -265,6 +277,7 @@ async def main_async(args: argparse.Namespace) -> None:
         },
         "memory": "fibonna",
         "projectPerConversation": settings.one_project_per_conversation,
+        "reusedProjects": run.reusing,
         "turnsSent": run.turns_sent,
         "compiledPages": run.compiled_pages,
         "harnessVersion": HARNESS_VERSION,
@@ -284,6 +297,17 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", help="results directory (default: results/fibonna-<split>)"
+    )
+    parser.add_argument(
+        "--reuse",
+        action="store_true",
+        help="ask again about conversations an earlier run sent and waited for: send nothing, wait for nothing",
+    )
+    parser.add_argument(
+        "--compile-stall-minutes",
+        type=positive_number,
+        default=STALL_TIMEOUT_SECONDS // 60,
+        help="stop when compiling has not moved for this long (default: %(default)s)",
     )
     return parser.parse_args()
 

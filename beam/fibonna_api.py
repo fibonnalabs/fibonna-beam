@@ -4,8 +4,7 @@ One token does everything: it ingests, reads the compile queue and recalls. Only
 
     GET  /api/v1/projects/resolve                 the benchmark project's id, from its slug
     POST /api/v1/ingest/text                      one turn, as a project memory with its event time
-    GET  /api/v1/knowledge/documents/{id}         whether a turn has been chunked and embedded
-    GET  /api/v1/brain/compile/jobs               whether the compile queue has drained
+    GET  /api/v1/brain/compile/jobs               each turn's compile job: queued, and finished
     GET  /api/v1/brain/index                      the wiki pages the compile produced
     GET  /api/v1/knowledge/projects/{id}/search   recall
 
@@ -15,7 +14,6 @@ Environment: FIBONNA_API_URL, FIBONNA_API_TOKEN, FIBONNA_BEAM_PROJECT (see `Sett
 import asyncio
 import os
 import time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -39,20 +37,20 @@ USER_AGENT = (
     "Mozilla/5.0 (fibonna-beam/0.1; +https://github.com/fibonnalabs/fibonna-beam)"
 )
 
-# How the wait is paced: how often the harness asks, how many turns it checks at once, and how many
-# polls in a row must find the compile queue empty (a turn's compile job is queued a moment after
-# the turn is chunked, so one empty poll can be that moment).
+# How the wait is paced: how often the harness asks, how long it waits while nothing moves before it
+# gives up, and how often it says where it is.
 POLL_SECONDS = 5
-TURNS_CHECKED_AT_ONCE = 8
-EMPTY_POLLS_TO_SETTLE = 2
+STALL_TIMEOUT_SECONDS = 30 * 60
 PROGRESS_LOG_SECONDS = 30
 
-# The compile job statuses that mean work is still to do, and the one that means it failed for good.
-UNFINISHED_JOB_STATUSES = ("pending", "running")
-FAILED_JOB_STATUS = "failed"
-
-# One look at what is left to wait for: a description of it, or None when there is nothing left.
-Check = Callable[[], Awaitable[str | None]]
+# A compile job's statuses. The jobs route lists a project's newest jobs of one status, 100 at most
+# and with no way to page on, so the harness asks for each status in turn and keeps what it has
+# seen: a job that has since dropped out of the newest 100 is not listed again. It asks again
+# every OBSERVE_EVERY_TURNS turns while sending, so that a queue that drains fast cannot push the
+# first turns' jobs out of sight before the wait begins.
+COMPILE_JOB_STATUSES = ("pending", "running", "completed", "failed", "skipped")
+COMPILE_JOBS_LIMIT = 100
+OBSERVE_EVERY_TURNS = 25
 
 REQUIRED_ENVIRONMENT = ("FIBONNA_API_URL", "FIBONNA_API_TOKEN", "FIBONNA_BEAM_PROJECT")
 CONVERSATION_PLACEHOLDER = "{conversation}"
@@ -70,6 +68,42 @@ class ProjectMissing(RuntimeError):
 class CompileFailed(RuntimeError):
     """Fibonna could not compile a turn. The run stops rather than score a conversation whose
     memory is incomplete."""
+
+
+class CompileTimedOut(CompileFailed):
+    """Compiling stopped moving: turns still have no compile job, or their jobs are not finishing."""
+
+
+@dataclass(frozen=True)
+class CompileJob:
+    """A turn's compile job as the jobs route reports it."""
+
+    id: int
+    status: str
+    error: str | None
+
+
+@dataclass(frozen=True)
+class CompileProgress:
+    """Where the compile of a set of turns stands. Equal progress means nothing has moved."""
+
+    without_job: tuple[int, ...]  # the documents no compile job has been queued for yet
+    pending: int
+    running: int
+    compiled: int
+
+    @property
+    def finished(self) -> bool:
+        return not self.without_job and not self.pending and not self.running
+
+    def describe(self) -> str:
+        text = (
+            f"{self.compiled} compiled, {self.pending} pending, {self.running} running"
+        )
+        if self.without_job:
+            first = ", ".join(str(d) for d in self.without_job[:5])
+            text += f", {len(self.without_job)} with no compile job yet (documents {first}…)"
+        return text
 
 
 @dataclass(frozen=True)
@@ -116,6 +150,9 @@ class FibonnaApi:
     def __init__(self, base_url: str, token: str, project: str) -> None:
         self.project = project  # the slug
         self._project_id: int | None = None
+        self._compile_jobs: dict[int, CompileJob] = {}  # by document id
+        self._turns_sent = 0
+        self._a_listing_was_full = False
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={
@@ -186,24 +223,58 @@ class FibonnaApi:
             raise FibonnaApiError(
                 f"Fibonna kept the event time {kept!r} for turn {item['id']}, sent {item['timestamp']}"
             )
+        self._turns_sent += 1
+        if self._turns_sent % OBSERVE_EVERY_TURNS == 0:
+            await self._observe_compile_jobs()
         return int(stored["document_id"])
 
     # --- Waiting for compile ------------------------------------------------------------------
 
     async def wait_until_compiled(
-        self, document_ids: list[int], conversation: str | None = None
+        self,
+        document_ids: list[int],
+        conversation: str | None = None,
+        stall_timeout: float = STALL_TIMEOUT_SECONDS,
     ) -> int:
-        """Waits until Fibonna has finished with every turn, and returns the project's wiki page count.
+        """Waits until every turn's own compile job has completed, and returns the wiki page count.
 
-        In two steps. First every turn must have been chunked and embedded: only then has its
-        compile job been queued. Then the project's compile queue must hold no pending or running
-        job, in several polls in a row. A job that failed stops the run.
+        A turn is compiled when the compile queue says so, for that turn: a compile job for its
+        document exists and has completed. Not when it has been chunked, and not when the queue
+        looks empty: a job is queued a while after the turn is stored, and until then the queue has
+        nothing to say about it. A job that failed or was skipped stops the run. So does a wait in
+        which nothing moves for `stall_timeout` seconds: no job is queued for a turn, or a queued
+        job never finishes. The wait has no other limit; a large conversation takes hours.
         """
-        started = time.monotonic()
-        await self._poll(
-            self._all_chunked(document_ids), started, "chunking", conversation
-        )
-        await self._poll(self._compile_drained(), started, "compiling", conversation)
+        started = last_moved = last_logged = time.monotonic()
+        previous: CompileProgress | None = None
+        while True:
+            await self._observe_compile_jobs()
+            progress = self._compile_progress(document_ids)
+            if progress.finished:
+                break
+            now = time.monotonic()
+            if progress != previous:
+                previous, last_moved = progress, now
+            elif now - last_moved >= stall_timeout:
+                raise CompileTimedOut(
+                    f"Compiling project {self.project!r} has not moved for {duration(stall_timeout)}: "
+                    f"{progress.describe()}. A turn with no compile job was never queued for compile "
+                    "(is compile on in the stack, and did the turn get chunked?); a job that stays "
+                    "pending or running is not being drained (is the compile drain running?)."
+                    + (
+                        f" The jobs route lists only the newest {COMPILE_JOBS_LIMIT} jobs of a status, "
+                        "so a job completed long ago may be out of sight (see README.md, 'Seeing the jobs')."
+                        if self._a_listing_was_full
+                        else ""
+                    )
+                )
+            if now - last_logged >= PROGRESS_LOG_SECONDS:
+                log(
+                    f"compiling: {progress.describe()} after {duration(now - started)}",
+                    conversation,
+                )
+                last_logged = now
+            await asyncio.sleep(POLL_SECONDS)
         pages = len(await self.brain_index())
         log(
             f"compiled into {pages} wiki page(s) after {duration(time.monotonic() - started)}",
@@ -211,80 +282,79 @@ class FibonnaApi:
         )
         return pages
 
-    async def _poll(
-        self, check: Check, started: float, stage: str, conversation: str | None
-    ) -> None:
-        """Calls `check`, which returns what is left to do or None when it is done, until it is done."""
-        last_progress = time.monotonic()
-        while (left := await check()) is not None:
-            if time.monotonic() - last_progress >= PROGRESS_LOG_SECONDS:
-                log(
-                    f"{stage}: {left} after {duration(time.monotonic() - started)}",
-                    conversation,
-                )
-                last_progress = time.monotonic()
-            await asyncio.sleep(POLL_SECONDS)
+    async def pages_of_a_compiled_project(self) -> int:
+        """The wiki page count of a project an earlier run has sent and waited for.
 
-    def _all_chunked(self, document_ids: list[int]) -> Check:
-        """A check that is done once every turn has chunks. A turn is looked at until it has some."""
-        waiting = list(document_ids)
+        For `--reuse`, which asks again without sending. What the compile queue still lists must be
+        finished and complete, and the project must hold wiki pages. It cannot show that every turn
+        was compiled: jobs that finished long ago are no longer listed (see COMPILE_JOB_STATUSES).
+        """
+        await self._observe_compile_jobs()
+        unfinished = {
+            document_id: job
+            for document_id, job in self._compile_jobs.items()
+            if job.status != "completed"
+        }
+        if unfinished:
+            document_id, job = next(iter(unfinished.items()))
+            raise CompileFailed(
+                f"Project {self.project!r} is not compiled: {len(unfinished)} compile job(s) are not "
+                f"completed, such as job {job.id} of document {document_id}, which is {job.status}."
+            )
+        pages = len(await self.brain_index())
+        if not pages:
+            raise CompileFailed(
+                f"Project {self.project!r} has no wiki pages: an earlier run must send its turns "
+                "and wait for them to compile before --reuse can ask about them."
+            )
+        return pages
 
-        async def check() -> str | None:
-            nonlocal waiting
-            slots = asyncio.Semaphore(TURNS_CHECKED_AT_ONCE)
-
-            async def has_chunks(document_id: int) -> bool:
-                async with slots:
-                    document = await self._call(
-                        "GET", f"/api/v1/knowledge/documents/{document_id}"
+    async def _observe_compile_jobs(self) -> None:
+        """Asks for the project's compile jobs of every status and keeps each document's newest."""
+        for status in COMPILE_JOB_STATUSES:
+            found = await self._call(
+                "GET",
+                "/api/v1/brain/compile/jobs",
+                params={
+                    "project_id": self.project_id,
+                    "status": status,
+                    "limit": COMPILE_JOBS_LIMIT,
+                },
+            )
+            if len(found.get("jobs") or []) >= COMPILE_JOBS_LIMIT:
+                self._a_listing_was_full = True
+            for job in found.get("jobs") or []:
+                if job.get("source_type") != "document":
+                    continue
+                document_id = int(job["source_id"])
+                known = self._compile_jobs.get(document_id)
+                if known is None or job["id"] >= known.id:
+                    self._compile_jobs[document_id] = CompileJob(
+                        id=job["id"], status=job["status"], error=job.get("error")
                     )
-                return int(document.get("chunk_count") or 0) > 0
 
-            # Turns are processed in the order they were sent, so the first one that is not ready
-            # tells the rest apart from the ones already done: look at no more than a window of them.
-            window = waiting[: TURNS_CHECKED_AT_ONCE * 4]
-            ready = await asyncio.gather(
-                *(has_chunks(document_id) for document_id in window)
-            )
-            waiting = [d for d, done in zip(window, ready) if not done] + waiting[
-                len(window) :
-            ]
-            return (
-                f"{len(waiting)}/{len(document_ids)} turns not yet chunked"
-                if waiting
-                else None
-            )
-
-        return check
-
-    def _compile_drained(self) -> Check:
-        """A check that is done once the compile queue has been empty for several polls in a row."""
-        empty_polls = 0
-
-        async def check() -> str | None:
-            nonlocal empty_polls
-            unfinished = sum(
-                [await self._compile_jobs(status) for status in UNFINISHED_JOB_STATUSES]
-            )
-            if await self._compile_jobs(FAILED_JOB_STATUS):
-                raise CompileFailed(f"A compile job of project {self.project!r} failed")
-            empty_polls = 0 if unfinished else empty_polls + 1
-            return (
-                None
-                if empty_polls >= EMPTY_POLLS_TO_SETTLE
-                else f"{unfinished} compile job(s) not finished"
-            )
-
-        return check
-
-    async def _compile_jobs(self, status: str) -> int:
-        """How many of the project's compile jobs have this status, counted up to one page of 100."""
-        found = await self._call(
-            "GET",
-            "/api/v1/brain/compile/jobs",
-            params={"project_id": self.project_id, "status": status, "limit": 100},
+    def _compile_progress(self, document_ids: list[int]) -> CompileProgress:
+        """Where each document's compile job stands, as last observed. A failed job raises."""
+        without_job: list[int] = []
+        counts = {"pending": 0, "running": 0, "completed": 0}
+        for document_id in document_ids:
+            job = self._compile_jobs.get(document_id)
+            if job is None:
+                without_job.append(document_id)
+            elif job.status in counts:
+                counts[job.status] += 1
+            else:
+                raise CompileFailed(
+                    f"Fibonna did not compile document {document_id} of project {self.project!r}: "
+                    f"its compile job {job.id} is {job.status}"
+                    + (f" ({job.error})" if job.error else "")
+                )
+        return CompileProgress(
+            without_job=tuple(without_job),
+            pending=counts["pending"],
+            running=counts["running"],
+            compiled=counts["completed"],
         )
-        return len(found.get("jobs") or [])
 
     async def brain_index(self) -> list[dict]:
         """The wiki pages of the project: `slug`, `title`, `page_type` and a one-line summary each."""

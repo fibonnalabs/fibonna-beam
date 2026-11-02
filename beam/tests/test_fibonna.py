@@ -6,10 +6,12 @@ The answer and judge model is replaced by two functions; nothing reaches the net
 """
 
 import argparse
+import asyncio
 import json
 import os
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +21,7 @@ import run_fibonna
 from dataset import build_conversation, to_ingest_item
 from fibonna_api import (
     CompileFailed,
+    CompileTimedOut,
     FibonnaApi,
     FibonnaApiError,
     ProjectMissing,
@@ -97,6 +100,14 @@ class FibonnaTestCase(unittest.IsolatedAsyncioTestCase):
         await api.open_project()
         return api
 
+    async def until(self, condition: Callable[[], bool]) -> None:
+        async with asyncio.timeout(10):
+            while not condition():
+                await asyncio.sleep(0.001)
+
+    def compile_job_requests(self) -> int:
+        return len(self.fibonna.calls("GET", "/api/v1/brain/compile/jobs"))
+
 
 class AdapterTest(FibonnaTestCase):
     async def ingest_conversation(self, api: FibonnaApi) -> list[int]:
@@ -111,18 +122,17 @@ class AdapterTest(FibonnaTestCase):
         document_ids = await self.ingest_conversation(api)
         pages = await api.wait_until_compiled(document_ids)
 
-        # Every turn was checked until chunked, and the queue was asked about until it was empty.
+        # The wait returned once each of the four turns had a compile job, and each had completed.
         self.assertEqual(pages, self.fibonna.pages)
-        self.assertGreater(
-            len(self.fibonna.calls("GET", r"/api/v1/knowledge/documents/\d+")),
-            len(document_ids),
-        )
-        asked = [
+        self.assertEqual(len(self.fibonna.jobs), len(document_ids))
+        self.assertEqual(self.fibonna.compiled_jobs(), len(document_ids))
+        asked = {
             r["query"]["status"]
             for r in self.fibonna.calls("GET", "/api/v1/brain/compile/jobs")
-        ]
-        self.assertEqual(asked.count("pending"), 3 + fibonna_api.EMPTY_POLLS_TO_SETTLE)
-        self.assertEqual(set(asked), {"pending", "running", "failed"})
+        }
+        self.assertEqual(asked, set(fibonna_api.COMPILE_JOB_STATUSES))
+        for request in self.fibonna.calls("GET", "/api/v1/brain/compile/jobs"):
+            self.assertEqual(request["query"]["project_id"], "11")
 
         # The end of the conversation: all four turns, as evidence text.
         recalled = await api.recall(
@@ -228,12 +238,21 @@ class AdapterTest(FibonnaTestCase):
             await api.open_project()
         self.assertEqual({r["method"] for r in self.fibonna.requests}, {"GET"})
 
-    async def test_a_failed_compile_job_stops_the_wait(self) -> None:
-        api = await self.api()
-        document_ids = await self.ingest_conversation(api)
-        self.fibonna.failed_compile_jobs = 1
-        with self.assertRaises(CompileFailed):
-            await api.wait_until_compiled(document_ids)
+    async def test_a_job_that_failed_or_was_skipped_stops_the_wait(self) -> None:
+        for final_status in ("failed", "skipped"):
+            with self.subTest(final_status):
+                self.fibonna.final_status = final_status
+                api = await self.api()
+                document_ids = await self.ingest_conversation(api)
+                with self.assertRaises(CompileFailed) as stopped:
+                    await api.wait_until_compiled(document_ids)
+                self.assertNotIsInstance(stopped.exception, CompileTimedOut)
+                self.assertIn(final_status, str(stopped.exception))
+                self.assertIn("document", str(stopped.exception))
+                if final_status == "failed":
+                    self.assertIn("boom", str(stopped.exception))
+                self.fibonna.documents.clear()
+                self.fibonna.jobs.clear()
 
     async def test_a_turn_dated_by_its_arrival_is_refused(self) -> None:
         api = await self.api()
@@ -250,6 +269,150 @@ class AdapterTest(FibonnaTestCase):
         self.fibonna.echo_window = False
         with self.assertRaises(FibonnaApiError):
             await api.recall("favourite colour", "2024-03-20T12:00:00.000003Z")
+
+
+class CompileBarrierTest(FibonnaTestCase):
+    """A turn is compiled when its own compile job has completed, and not before it exists."""
+
+    async def ingest_conversation(self, api: FibonnaApi) -> list[int]:
+        conversation = build_conversation(beam_row("7", "red", "blue"))
+        return [
+            await api.ingest_turn(to_ingest_item(conversation, message))
+            for message in conversation.messages
+        ]
+
+    async def test_the_wait_holds_while_no_compile_job_is_queued_yet(self) -> None:
+        # The turns are stored and chunked, and their compile jobs are queued a while later.
+        self.fibonna.hold_compile_enqueue = True
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+
+        waiting = asyncio.create_task(api.wait_until_compiled(document_ids))
+        self.addCleanup(waiting.cancel)
+        # The queue is asked about several times, and has no job for any turn: the wait stays.
+        asked_before = self.compile_job_requests()
+        await self.until(
+            lambda: (
+                self.compile_job_requests()
+                >= asked_before + 3 * len(fibonna_api.COMPILE_JOB_STATUSES)
+            )
+        )
+        self.assertFalse(waiting.done())
+        self.assertEqual(self.fibonna.jobs, {})
+
+        self.fibonna.release_compile_enqueue()
+        pages = await asyncio.wait_for(waiting, 10)
+        # It returned after the jobs were queued, and only when each had completed.
+        self.assertEqual(len(self.fibonna.jobs), len(document_ids))
+        self.assertEqual(self.fibonna.compiled_jobs(), len(document_ids))
+        self.assertEqual(pages, self.fibonna.pages)
+
+    async def test_a_turn_still_without_a_job_is_waited_for_when_the_others_are_done(
+        self,
+    ) -> None:
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        # The first three have completed jobs; the fourth's job is not queued yet.
+        self.fibonna.hold_compile_enqueue = True
+        conversation = build_conversation(beam_row("7", "red", "blue"))
+        late = await api.ingest_turn(
+            {
+                **to_ingest_item(conversation, conversation.messages[0]),
+                "id": "7_late",
+                "timestamp": "2024-03-21T12:00:00+00:00",
+            }
+        )
+
+        waiting = asyncio.create_task(api.wait_until_compiled([*document_ids, late]))
+        self.addCleanup(waiting.cancel)
+        await self.until(lambda: self.fibonna.compiled_jobs() == len(document_ids))
+        asked_before = self.compile_job_requests()
+        await self.until(lambda: self.compile_job_requests() >= asked_before + 20)
+        self.assertFalse(waiting.done())
+
+        self.fibonna.release_compile_enqueue()
+        await asyncio.wait_for(waiting, 10)
+        self.assertEqual(self.fibonna.compiled_jobs(), len(document_ids) + 1)
+
+    async def test_a_turn_that_never_gets_a_job_times_out_naming_it(self) -> None:
+        self.fibonna.hold_compile_enqueue = True
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        with self.assertRaises(CompileTimedOut) as stopped:
+            await api.wait_until_compiled(document_ids, stall_timeout=0.05)
+        message = str(stopped.exception)
+        self.assertIn("beam-7", message)
+        self.assertIn("4 with no compile job", message)
+        self.assertIn(str(document_ids[0]), message)
+        # It is a CompileFailed, which is what stops the runner with a message.
+        self.assertIsInstance(stopped.exception, CompileFailed)
+
+    async def test_a_job_that_never_finishes_times_out(self) -> None:
+        self.fibonna.drains = False
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        with self.assertRaises(CompileTimedOut) as stopped:
+            await api.wait_until_compiled(document_ids, stall_timeout=0.05)
+        self.assertIn("4 pending", str(stopped.exception))
+
+    async def test_a_wait_that_is_moving_is_not_timed_out(self) -> None:
+        # Four turns whose jobs each take two listings: slower than the stall timeout in all, but
+        # never still for that long.
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        with mock.patch.object(fibonna_api, "POLL_SECONDS", 0.02):
+            await api.wait_until_compiled(document_ids, stall_timeout=0.1)
+        self.assertEqual(self.fibonna.compiled_jobs(), len(document_ids))
+
+    async def test_a_job_another_turn_owns_does_not_complete_this_turn(self) -> None:
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        # Only the first turn's job is queued; the others' are held back.
+        stray = next(iter(self.fibonna.jobs.values()))
+        del self.fibonna.jobs[4], self.fibonna.jobs[3], self.fibonna.jobs[2]
+        self.assertEqual(stray["source_id"], str(document_ids[0]))
+        with self.assertRaises(CompileTimedOut) as stopped:
+            await api.wait_until_compiled(document_ids, stall_timeout=0.05)
+        self.assertIn("3 with no compile job", str(stopped.exception))
+
+    async def test_jobs_beyond_the_newest_page_are_still_counted(self) -> None:
+        # The jobs route lists the newest `limit` of a status only. Jobs that finished before the
+        # wait began fall out of the newest two, but were seen while the turns were sent.
+        self.fibonna.instant_drain = True
+        api = await self.api()
+        with (
+            mock.patch.object(fibonna_api, "COMPILE_JOBS_LIMIT", 2),
+            mock.patch.object(fibonna_api, "OBSERVE_EVERY_TURNS", 1),
+        ):
+            document_ids = await self.ingest_conversation(api)
+            await api.wait_until_compiled(document_ids, stall_timeout=1)
+
+    async def test_a_timeout_says_when_older_jobs_may_be_out_of_sight(self) -> None:
+        # The turns were stored and compiled before the wait began, with no look at the queue between.
+        self.fibonna.instant_drain = True
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        with (
+            mock.patch.object(fibonna_api, "COMPILE_JOBS_LIMIT", 2),
+            self.assertRaises(CompileTimedOut) as stopped,
+        ):
+            await api.wait_until_compiled(document_ids, stall_timeout=0.05)
+        self.assertIn("2 with no compile job", str(stopped.exception))
+        self.assertIn("newest 2 jobs", str(stopped.exception))
+
+    async def test_the_jobs_of_other_sources_are_left_alone(self) -> None:
+        api = await self.api()
+        document_ids = await self.ingest_conversation(api)
+        # A project pulse job shares the queue; it has no document, and its failure is not a turn's.
+        self.fibonna.jobs[99] = {
+            "id": 99,
+            "project_id": 11,
+            "source_type": "project_pulse",
+            "source_id": "11",
+            "status": "failed",
+            "error": "pulse",
+        }
+        await api.wait_until_compiled(document_ids)
 
 
 class SettingsTest(unittest.TestCase):
@@ -310,9 +473,19 @@ class RunnerTest(FibonnaTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def arguments(self, conversations: int | None = None) -> argparse.Namespace:
+    def arguments(
+        self,
+        conversations: int | None = None,
+        *,
+        reuse: bool = False,
+        output: Path | None = None,
+    ) -> argparse.Namespace:
         return argparse.Namespace(
-            split="100k", conversations=conversations, output=str(self.output)
+            split="100k",
+            conversations=conversations,
+            output=str(output or self.output),
+            compile_stall_minutes=30,
+            reuse=reuse,
         )
 
     async def test_a_run_scores_every_question_in_its_own_project(self) -> None:
@@ -355,6 +528,82 @@ class RunnerTest(FibonnaTestCase):
                 for prompt in self.prompts
             )
         )
+
+    async def test_nothing_is_asked_before_every_turn_has_compiled(self) -> None:
+        # The compile jobs are queued only after the turns are stored: the run waits for them.
+        self.fibonna.hold_compile_enqueue = True
+        running = asyncio.create_task(run_fibonna.main_async(self.arguments()))
+        self.addCleanup(running.cancel)
+        await self.until(lambda: len(self.fibonna.documents) == 8)
+        asked_before = self.compile_job_requests()
+        await self.until(lambda: self.compile_job_requests() >= asked_before + 20)
+        self.assertFalse(running.done())
+        self.assertEqual(
+            self.fibonna.calls("GET", r"/api/v1/knowledge/projects/\d+/search"), []
+        )
+
+        self.fibonna.release_compile_enqueue()
+        await asyncio.wait_for(running, 30)
+        self.assertEqual(self.fibonna.compiled_at_first_search, 8)
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertEqual(summary["failedQuestions"], 0)
+
+    async def test_a_run_whose_compile_stops_moving_is_stopped_with_a_message(
+        self,
+    ) -> None:
+        self.fibonna.hold_compile_enqueue = True
+        with mock.patch.object(fibonna_api, "STALL_TIMEOUT_SECONDS", 0.05):
+            arguments = self.arguments(conversations=1)
+            arguments.compile_stall_minutes = 0.05 / 60
+            with self.assertRaises(ExceptionGroup) as stopped:
+                await run_fibonna.main_async(arguments)
+        self.assertTrue(stopped.exception.subgroup(CompileTimedOut))
+        self.assertEqual(
+            self.fibonna.calls("GET", r"/api/v1/knowledge/projects/\d+/search"), []
+        )
+
+    async def test_a_second_run_asks_again_without_sending_or_waiting(self) -> None:
+        await run_fibonna.main_async(self.arguments())
+        stored = len(self.fibonna.calls("POST", "/api/v1/ingest/text"))
+        jobs_asked = self.compile_job_requests()
+
+        again = self.output.parent / "again"
+        await run_fibonna.main_async(self.arguments(reuse=True, output=again))
+
+        self.assertEqual(len(self.fibonna.calls("POST", "/api/v1/ingest/text")), stored)
+        self.assertEqual(len(self.fibonna.documents), 8)
+        summary = json.loads((again / "summary.json").read_text())
+        self.assertEqual(
+            (summary["questions"], summary["failedQuestions"], summary["turnsSent"]),
+            (4, 0, 0),
+        )
+        self.assertTrue(summary["reusedProjects"])
+        self.assertEqual(summary["compiledPages"], {"7": 2, "8": 2})
+        # The queue was looked at once for each of the two projects: five statuses each.
+        self.assertEqual(
+            self.compile_job_requests() - jobs_asked,
+            2 * len(fibonna_api.COMPILE_JOB_STATUSES),
+        )
+
+    async def test_a_second_run_refuses_a_project_that_is_still_compiling(self) -> None:
+        await run_fibonna.main_async(self.arguments())
+        self.fibonna.jobs[1]["status"] = "running"
+        self.fibonna.drains = False  # it stays running
+        again = self.output.parent / "again"
+        with self.assertRaises(ExceptionGroup) as stopped:
+            await run_fibonna.main_async(self.arguments(reuse=True, output=again))
+        self.assertIn("not compiled", str(stopped.exception.exceptions[0]))
+        self.assertFalse((again / "results.jsonl").exists())
+
+    async def test_a_second_run_refuses_a_project_with_no_wiki_pages(self) -> None:
+        await run_fibonna.main_async(self.arguments(conversations=1))
+        self.fibonna.pages = 0
+        again = self.output.parent / "again"
+        with self.assertRaises(ExceptionGroup) as stopped:
+            await run_fibonna.main_async(
+                self.arguments(conversations=1, reuse=True, output=again)
+            )
+        self.assertIn("no wiki pages", str(stopped.exception.exceptions[0]))
 
     async def test_a_run_resumes_after_the_conversations_already_scored(self) -> None:
         await run_fibonna.main_async(self.arguments(conversations=1))

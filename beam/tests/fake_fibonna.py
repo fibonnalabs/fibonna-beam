@@ -1,8 +1,13 @@
 """A stand-in for the Fibonna routes the harness uses, served from this process on a local port.
 
 It keeps what the real API keeps for the harness: projects, the turns stored in them with their
-event time, a compile queue that drains over a few polls, and a search that keeps the memories that
+event time, a compile queue with one job per turn, and a search that keeps the memories that
 happened before a moment (that moment excluded) and echoes the window it applied.
+
+The compile queue works as the real one does. A turn's job is queued some time after the turn is
+stored (`hold_compile_enqueue` holds that moment back until `release_compile_enqueue`). The jobs
+route lists a project's newest jobs of one status, `limit` at most. A job moves on each time it is
+listed: pending, running, then `final_status`.
 """
 
 import json
@@ -36,9 +41,15 @@ class FakeFibonna:
         self.failures: dict[
             str, list[int]
         ] = {}  # "METHOD path" -> statuses to answer, once each
-        self.chunk_polls_before_ready = 1
-        self.pending_polls_left = 3  # polls of the compile queue that still find a job
-        self.failed_compile_jobs = 0
+        self.jobs: dict[int, dict] = {}  # compile jobs by id
+        self.hold_compile_enqueue = False  # True: stored turns get no compile job yet
+        self.instant_drain = False  # True: a job is queued already finished
+        self.drains = True  # False: a queued job stays pending
+        self.final_status = (
+            "completed"  # or "failed" or "skipped": how a job that runs ends
+        )
+        self.compiled_at_first_search: int | None = None
+        self._held: list[int] = []
         self.echo_window = True
         self.keep_event_time = True  # False: dates a turn by when it arrived
         self.pages = 2
@@ -83,12 +94,8 @@ class FakeFibonna:
             }
         if method == "POST" and path == "/api/v1/ingest/text":
             return self.store(body)
-        if method == "GET" and (
-            m := re.fullmatch(r"/api/v1/knowledge/documents/(\d+)", path)
-        ):
-            return self.read_document(int(m[1]))
         if method == "GET" and path == "/api/v1/brain/compile/jobs":
-            return 200, {"jobs": self.compile_jobs(query["status"])}
+            return self.list_compile_jobs(query)
         if method == "GET" and path == "/api/v1/brain/index":
             return 200, [
                 {
@@ -132,8 +139,11 @@ class FakeFibonna:
             "markdown": markdown,
             "content": body["content"],
             "occurred_at": occurred_at,
-            "chunk_polls": 0,
         }
+        if self.hold_compile_enqueue:
+            self._held.append(document_id)
+        else:
+            self.enqueue_compile(document_id)
         return 200, {
             "status": "queued",
             "document_id": document_id,
@@ -142,27 +152,58 @@ class FakeFibonna:
             "job_ids": [document_id],
         }
 
-    def read_document(self, document_id: int) -> tuple[int, object]:
-        document = self.documents.get(document_id)
-        if document is None:
-            return 404, {"detail": "Document not found"}
-        document["chunk_polls"] += 1
-        ready = document["chunk_polls"] > self.chunk_polls_before_ready
-        return 200, {
-            "document_id": document_id,
-            "chunk_count": 1 if ready else 0,
-            "content": document["content"],
+    def enqueue_compile(self, document_id: int) -> None:
+        job_id = len(self.jobs) + 1
+        self.jobs[job_id] = {
+            "id": job_id,
+            "project_id": self.documents[document_id]["project_id"],
+            "source_type": "document",
+            "source_id": str(document_id),
+            "status": self.final_status if self.instant_drain else "pending",
+            "error": "boom" if self.final_status == "failed" else None,
         }
 
-    def compile_jobs(self, status: str) -> list[dict]:
-        if status == "pending" and self.pending_polls_left > 0:
-            self.pending_polls_left -= 1
-            return [{"id": 1, "status": "pending"}]
-        if status == "failed" and self.failed_compile_jobs:
-            return [{"id": 2, "status": "failed"}]
-        return []
+    def release_compile_enqueue(self) -> None:
+        """The moment the stored turns' compile jobs are queued."""
+        with self._lock:
+            self.hold_compile_enqueue = False
+            for document_id in self._held:
+                self.enqueue_compile(document_id)
+            self._held.clear()
+
+    def list_compile_jobs(self, query: dict) -> tuple[int, object]:
+        limit = int(query.get("limit", 20))
+        if not 1 <= limit <= 100:
+            return 422, {"detail": "limit must be between 1 and 100"}
+        project_id = int(query["project_id"])
+        status = query.get("status")
+        newest_first = sorted(self.jobs.values(), key=lambda job: -job["id"])
+        listed = [
+            job
+            for job in newest_first
+            if job["project_id"] == project_id
+            and (status is None or job["status"] == status)
+        ][:limit]
+        views = [dict(job) for job in listed]
+        for job in listed:
+            self.move_on(job)
+        return 200, {"jobs": views}
+
+    def move_on(self, job: dict) -> None:
+        if not self.drains:
+            return
+        if job["status"] == "pending":
+            job["status"] = "running"
+        elif job["status"] == "running":
+            job["status"] = self.final_status
+            job["error"] = "boom" if self.final_status == "failed" else None
+
+    def compiled_jobs(self) -> int:
+        return sum(job["status"] == "completed" for job in self.jobs.values())
 
     def search(self, project_id: int, query: dict) -> tuple[int, object]:
+        if self.compiled_at_first_search is None:
+            self.compiled_at_first_search = self.compiled_jobs()
         before = utc(query["occurred_before"])
         words = set(re.findall(r"\w+", query["q"].lower()))
         found = []

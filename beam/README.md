@@ -110,9 +110,8 @@ question would be answered from the others' turns too.
 The stack needs: the compile drain running (the gateway's schedule), and search accepting up to
 100 results and an 8,000-token evidence budget, which is past.dev's recall budget (the setting
 behind `search_evidence_budget_enabled`). It uses these product routes, and no others:
-`GET /api/v1/projects/resolve`, `POST /api/v1/ingest/text`, `GET /api/v1/knowledge/documents/{id}`,
-`GET /api/v1/brain/compile/jobs`, `GET /api/v1/brain/index` and
-`GET /api/v1/knowledge/projects/{id}/search`.
+`GET /api/v1/projects/resolve`, `POST /api/v1/ingest/text`, `GET /api/v1/brain/compile/jobs`,
+`GET /api/v1/brain/index` and `GET /api/v1/knowledge/projects/{id}/search`.
 
 ### How a conversation is sent and asked
 
@@ -120,9 +119,22 @@ behind `search_evidence_budget_enabled`). It uses these product routes, and no o
   (`occurred_at`, to the microsecond, as in the Past run). Its title is the author and the turn's
   id, which keeps two turns with the same words as two memories. Sending a turn again finds the
   memory already stored, so a run that stopped can be started again without storing anything twice.
-- **Waiting.** The harness polls until every turn has been chunked, then until the project's
-  compile queue has had no pending or running job for two polls in a row, and logs the number of
-  wiki pages the compile produced. A compile job that failed stops the run.
+- **Waiting.** A turn counts as compiled when its own compile job has completed, and the harness
+  waits for each turn separately. A turn is chunked first and its compile job is queued a while
+  after that, so a turn with no job yet is not compiled: the harness keeps waiting for the job to
+  exist, then for it to finish. It logs the number of wiki pages the compile produced. A job that
+  failed or was skipped stops the run, naming the turn. So does a wait in which nothing moves for 30
+  minutes, either because a turn never got a job (compile is off in the stack, or its chunking
+  failed) or because a job stays pending or running (the compile drain is not running);
+  `--compile-stall-minutes N` changes the 30. The time counts only while nothing moves, so a
+  conversation that takes hours to compile is not stopped.
+- **Seeing the jobs.** `GET /api/v1/brain/compile/jobs` lists a project's newest jobs of one status,
+  100 at most, with no way to page on. The harness asks for each status in turn, every few
+  seconds and every 25 turns while sending, and keeps what it has seen. A job that completed and
+  then fell out of the newest 100 before the harness ever listed it cannot be seen again: that
+  happens when the turns of a conversation are sent again into a project that already compiled
+  them. The wait then stops with the stall message above, naming the documents it could not see a
+  job for. To ask again about a project that is already compiled, use `--reuse` (below).
 - **Asking.** Search runs as of the moment the question is asked, the end of the conversation or
   for knowledge-update questions the update the dataset cites, and the turn at that moment is
   included. The answer model reads the evidence search returns, in ExaBase's answer prompt; the
@@ -158,10 +170,24 @@ python run_fibonna.py --split 100k
 python verify.py results/fibonna-100k
 ```
 
-Results go to `results/fibonna-100k/`, which git ignores. Run the command again to resume: scored
-conversations are skipped. Run it with another `--output` to ask every question again, for example
-with another judge; the turns are found in their projects, not stored again, so nothing compiles a
-second time.
+Results go to `results/fibonna-100k/`, which git ignores. If the run stops, run the command again:
+scored conversations are skipped, and a conversation that was not finished is sent again (turns
+already stored are found, not stored twice) and waited for again. That second wait can hit the limit
+described under "Seeing the jobs" if the conversation had been compiled in full; start it in a
+fresh project, or use `--reuse` if its first run did finish waiting.
+
+To ask every question again, for example with another judge, run it with `--reuse` and another
+`--output`:
+
+```bash
+BEAM_JUDGE_MODEL=<an OpenRouter model id> python run_fibonna.py --split 100k --reuse --output results/fibonna-100k-judge-2
+```
+
+`--reuse` sends nothing and waits for nothing, so nothing is stored or compiled a second time. It
+stops if a project still has a compile job that has not completed, or has no wiki pages. It cannot
+prove that every turn was compiled, since jobs that finished long ago are no longer listed: use it
+only on projects an earlier run of the harness sent and waited for. `summary.json` says
+`"reusedProjects": true`.
 
 ### Compile cost estimate
 
@@ -183,8 +209,9 @@ may compile for more than the average, and a stack with a request size limit may
 past.dev's run has one model answer and judge. To also report a judge from another family, set
 `BEAM_JUDGE_MODEL` to the OpenRouter id of a model that is not OpenAI's. Only the judge's calls use
 it: the answers still come from `openai/gpt-5.6-luna`, and `summary.json` records both models.
-Report the two runs side by side, with the model ids. Try it in the dry run first: the judge is
-asked for strict JSON, which not every provider enforces.
+Report the two runs side by side, with the model ids. Run the second with `--reuse` (above), so the
+memory is not sent and compiled again. Try it in the dry run first: the judge is asked for strict
+JSON, which not every provider enforces.
 
 ### Licences
 
@@ -199,7 +226,9 @@ python -m unittest discover -s tests -t .
 ```
 
 They run the adapter and the runner against a stand-in for the Fibonna API on a local port, and a
-stand-in for the model. Nothing reaches the network.
+stand-in for the model. Nothing reaches the network. The stand-in queues each turn's compile job
+after the turn is stored, as the API does, and the tests cover a wait that begins before any job
+exists, a job that fails, a job that never finishes, and a turn that never gets one.
 
 ## Check a run
 
